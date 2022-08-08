@@ -20,7 +20,13 @@ class BaseStorage:
 class JsonFileStorage(BaseStorage):
     def __init__(self, file_path: Optional[str] = None):
         self.file_path = file_path
-        print(self.file_path)
+        if not os.path.exists(file_path):
+            with open(self.file_path, 'w+') as json_file:
+                init_state = {
+                    'last_sync_timestamp': '0001-01-01 00:00:00',
+                    'filmwork_ids': []
+                }
+                json.dump(init_state, json_file)
 
     def save_state(self, state: dict) -> None:
         with open(self.file_path, 'w+') as json_file:

@@ -1,23 +1,24 @@
 import datetime
 import time
 from functools import wraps
+from typing import Iterator
 
 import elasticsearch
-from elasticsearch import Elasticsearch
+from elasticsearch import Elasticsearch, helpers
 import psycopg2
 from psycopg2 import errors as psycopg2_errors
-from psycopg2.extras import DictCursor
 import logging
 from dotenv import load_dotenv
 import os
 from state import state
+import psycopg2.extras
 
 import json
 
 
 logging.basicConfig(filename="es.log", level=logging.INFO)
 
-es = Elasticsearch(hosts="http://localhost:9200/")
+es = Elasticsearch(hosts="http://elasticsearch:9200/")
 logging.info(es.ping())
 
 
@@ -145,7 +146,9 @@ else:
 
 def backoff(start_sleep_time=0.1, factor=2, border_sleep_time=10):
     """
-    Функция для повторного выполнения функции через некоторое время, если возникла ошибка. Использует наивный экспоненциальный рост времени повтора (factor) до граничного времени ожидания (border_sleep_time)
+    Функция для повторного выполнения функции через некоторое время, если возникла ошибка.
+    Использует наивный экспоненциальный рост времени повтора (factor)
+    до граничного времени ожидания (border_sleep_time)
 
     Формула:
         t = start_sleep_time * 2^(n) if t < border_sleep_time
@@ -172,8 +175,7 @@ def backoff(start_sleep_time=0.1, factor=2, border_sleep_time=10):
                         psycopg2_errors.ConnectionFailure,
                         psycopg2_errors.TransactionResolutionUnknown,
                         psycopg2_errors.InvalidTransactionState,
-                        elasticsearch.TransportError, elasticsearch.ConnectionTimeout,
-                        elasticsearch.ConnectionError
+                        elasticsearch.ConnectionTimeout, elasticsearch.ConnectionError
                 ) as e:
                     tries += 1
                     logging.error(str(e))
@@ -190,7 +192,7 @@ dsl = {'dbname': os.environ.get('dbname'), 'user': os.environ.get('user'),
 
 
 class Extractor:
-    def __init__(self, dsl, chunk_size):
+    def __init__(self, dsl: dict[str], chunk_size: int) -> None:
         self.connection = psycopg2.connect(**dsl)
         self.chunk_size = chunk_size
 
@@ -199,8 +201,9 @@ class Extractor:
             self, extract_timestamp: datetime.datetime,
             start_timestamp: datetime.datetime,
             exclude_ids: list
-    ):
-        """Читаем данные пачками. В случае падения начинаем читать с последней обработанной записи"""
+    ) -> Iterator[dict | None]:
+        """Читаем данные пачками. В случае падения начинаем читать с последней обработанной записи
+        """
         with self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
             sql = """
             SELECT fw.id,
@@ -222,6 +225,7 @@ class Extractor:
             GROUP BY fw.id
             HAVING GREATEST(MAX(fw.modified), MAX(g.modified), MAX(p.modified)) > %(extract_timestamp)s
             """
+
             if exclude_ids:
                 sql += """
                 AND (fw.id not in %(exclude_ids)s OR 
@@ -240,7 +244,6 @@ class Extractor:
             while True:
                 rows = cursor.fetchmany(self.chunk_size)
                 if not rows:
-                    cursor.close()
                     break
                 for data in rows:
                     ids_list = state.get_state("filmwork_ids")
@@ -250,8 +253,10 @@ class Extractor:
 
 
 class Transformer:
-    def transform(self, data):
-        """Обработка данных из Postgres и преобразование в формат для ElasticSearch"""
+    def transform(self, data: dict) -> list[dict]:
+        """Обработка данных из Postgres и преобразование в формат для ElasticSearch
+        :param data: Словарь из Postgres
+        """
         butch = []
         for row in data:
             filmwork = {
@@ -272,31 +277,34 @@ class Transformer:
 
 class Loader:
     @backoff()
-    def load(self, data):
-        """Загружаем данные пачтами в ElasticSearch"""
-        for row in data:
-            response = es.index(
-                index='movies',
-                doc_type='_doc',
-                id=row['id'],
-                document=row,
-                request_timeout=45
-            )
-            logging.info(response)
+    def load(self, data: list[dict]) -> None:
+        """Загружаем данные пачками в ElasticSearch
+        :param data: Преобразованные словари для вставки в ElasticSearch
+        """
+        actions = [
+            {
+                '_index': 'movies',
+                '_id': row['id'],
+                '_source': row,
+            }
+            for row in data
+        ]
+        helpers.bulk(es, actions)
 
 
 class ETL:
-
     def __init__(
             self, extractor: Extractor,
             transformer: Transformer,
             loader: Loader
-    ):
+    ) -> None:
         self.extractor = extractor
         self.transformer = transformer
         self.loader = loader
 
-    def run(self):
+    def run(self) -> None:
+        """Пошаговая реализация ETL.
+        """
         start_timestamp = datetime.datetime.now()
         for butch in self.extractor.extract(
             extract_timestamp=state.get_state('last_sync_timestamp'),
@@ -310,6 +318,11 @@ class ETL:
 
 
 if __name__ == "__main__":
+    """Запуск программы.
+       :Extractor param dsl: Подключение к Postgresql.
+       :Extractor param chunk_size: Количество данных в пачке
+    """
     etl = ETL(Extractor(dsl, 50), Transformer(), Loader())
-    etl.run()
-
+    while True:
+        etl.run()
+        time.sleep(60)
